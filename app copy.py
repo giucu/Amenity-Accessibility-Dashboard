@@ -1,11 +1,9 @@
 import json
 import os
 import glob
-
 import geopandas as gpd
 import pandas as pd
 import plotly.express as px
-from plotly.express.colors import sample_colorscale
 from dash import Dash, dcc, html, Input, Output, State, ALL, MATCH, callback, ctx, no_update
 import dash_bootstrap_components as dbc
 
@@ -24,6 +22,7 @@ def discover_city_files(data_dir="data"):
 
 
 # ── Load data ──────────────────────────────────────────────────────────────────
+
 CITIES = discover_city_files("data")
 
 city_data = {}
@@ -41,10 +40,12 @@ for city, path in CITIES.items():
 all_columns = sorted(all_columns)
 
 CITY_NAMES = list(city_data.keys())
-DEFAULT_CITY = CITY_NAMES[0] if CITY_NAMES else None
+DEFAULT_CITY = CITY_NAMES[2] if CITY_NAMES else None
+sample_gdf = city_data.get(DEFAULT_CITY, {}).get("gdf", pd.DataFrame())
 
 
 # ── Metric groups ──────────────────────────────────────────────────────────────
+
 def cols_matching(prefix=None, contains=None, exact=None, exclude_contains=None):
     cols = all_columns.copy()
 
@@ -77,9 +78,11 @@ GROUP_OPTIONS = [{"label": g, "value": g} for g in METRIC_GROUPS]
 
 DEFAULT_GROUP = list(METRIC_GROUPS.keys())[0] if METRIC_GROUPS else None
 DEFAULT_METRIC = METRIC_GROUPS[DEFAULT_GROUP][0] if DEFAULT_GROUP else None
+DEFAULT_QUANTILES = 15
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 def available_metrics_for_city(city, group):
     if city not in city_data or group not in METRIC_GROUPS:
         return []
@@ -88,40 +91,8 @@ def available_metrics_for_city(city, group):
     return [c for c in METRIC_GROUPS[group] if c in city_cols]
 
 
-def safe_quantile_labels(series, q):
-    values = pd.to_numeric(series, errors="coerce")
-    valid = values.dropna()
-
-    if valid.empty:
-        return None, None, None
-
-    q = max(2, min(int(q), 50, valid.nunique()))
-
-    try:
-        _, bin_edges = pd.qcut(valid, q=q, retbins=True, duplicates="drop")
-    except ValueError:
-        return None, None, None
-
-    actual_q = len(bin_edges) - 1
-    if actual_q < 1:
-        return None, None, None
-
-    labels = [
-        f"Q{i + 1}: {bin_edges[i]:.2f}–{bin_edges[i + 1]:.2f}"
-        for i in range(actual_q)
-    ]
-
-    try:
-        binned = pd.qcut(valid, q=actual_q, labels=labels, duplicates="drop")
-    except ValueError:
-        return None, None, None
-
-    full = pd.Series(index=series.index, dtype="object")
-    full.loc[valid.index] = binned.astype(str)
-    return full, labels, actual_q
-
-
 # ── Map builder ────────────────────────────────────────────────────────────────
+
 def make_map(city, metric, cmap, quantiles=7, compact=False):
     if not city or not metric or city not in city_data:
         return {}
@@ -132,38 +103,73 @@ def make_map(city, metric, cmap, quantiles=7, compact=False):
     if metric not in gdf.columns or "from_id" not in gdf.columns:
         return {}
 
-    binned, labels, actual_q = safe_quantile_labels(gdf[metric], quantiles)
-    if binned is None:
+    values = pd.to_numeric(gdf[metric], errors="coerce")
+    mask = values.notna()
+    valid = values[mask]
+
+    if valid.empty:
         return {}
 
-    gdf["_bin"] = binned
-    plot_gdf = gdf.dropna(subset=["_bin"]).copy()
+    q = max(2, min(int(quantiles), 50, int(valid.nunique())))
+
+    try:
+        codes, bin_edges = pd.qcut(valid, q=q, labels=False, retbins=True, duplicates="drop")
+    except Exception as e:
+        print(f"qcut failed for {city} / {metric}: {e}")
+        return {}
+
+    actual_q = len(bin_edges) - 1
+    if actual_q < 1:
+        return {}
+
+    labels = [
+        f"Q{i+1}: {bin_edges[i]:.2f}–{bin_edges[i+1]:.2f}"
+        for i in range(actual_q)
+    ]
+
+    gdf["_qcode"] = None
+    gdf.loc[valid.index, "_qcode"] = codes.astype(int)
+
+    plot_gdf = gdf.dropna(subset=["_qcode"]).copy()
     if plot_gdf.empty:
+        print(f"No rows left after quantile binning for {city} / {metric}")
         return {}
 
-    colors = sample_colorscale(cmap, [i / max(actual_q - 1, 1) for i in range(actual_q)])
-    color_map = dict(zip(labels, colors))
+    plot_gdf["_qcode"] = plot_gdf["_qcode"].astype(int)
+    plot_gdf["_qlabel"] = plot_gdf["_qcode"].map(lambda x: labels[x])
 
-    center_geom = gdf.to_crs(gdf.estimate_utm_crs()).centroid.to_crs("EPSG:4326")
-    center_lat = center_geom.y.mean()
-    center_lon = center_geom.x.mean()
+    try:
+        center_geom = gdf.to_crs(gdf.estimate_utm_crs()).centroid.to_crs("EPSG:4326")
+        center_lat = center_geom.y.mean()
+        center_lon = center_geom.x.mean()
+    except Exception as e:
+        print(f"centroid failed for {city}: {e}")
+        center_lat = 48.8566
+        center_lon = 2.3522
 
     fig = px.choropleth_map(
         plot_gdf,
         geojson=geojson,
         locations="from_id",
         featureidkey="properties.from_id",
-        color="_bin",
-        color_discrete_map=color_map,
-        category_orders={"_bin": labels},
-        hover_data={metric: ':.3f', "_bin": True},
+        color="_qlabel",
+        category_orders={"_qlabel": labels},
+        color_discrete_sequence=px.colors.sample_colorscale(
+            cmap,
+            [i / max(actual_q - 1, 1) for i in range(actual_q)]
+        ),
+        hover_data={
+            metric: True,
+            "_qlabel": True,
+            "_qcode": False,
+        },
         map_style="carto-positron",
         zoom=10 if compact else 11,
         center={"lat": center_lat, "lon": center_lon},
-        opacity=0.78,
+        opacity=0.75,
         labels={
             metric: metric.replace("_", " ").title(),
-            "_bin": f"{metric.replace('_', ' ').title()} quantiles",
+            "_qlabel": "Quantile",
         },
     )
 
@@ -178,37 +184,14 @@ def make_map(city, metric, cmap, quantiles=7, compact=False):
             "y": 0.98,
             "xanchor": "left",
             "x": 0.01,
-            "bgcolor": "rgba(255,255,255,0.88)",
         },
-        uirevision=f"{city}_{metric}_{cmap}_{quantiles}",
+        uirevision=f"{city}_{metric}_{quantiles}",
     )
     return fig
 
 
-# ── UI helpers ────────────────────────────────────────────────────────────────
-def field_label(text):
-    return html.Label(
-        text,
-        style={
-            "fontSize": "11px",
-            "fontWeight": "600",
-            "color": "#7a7974",
-            "textTransform": "uppercase",
-            "letterSpacing": "0.04em",
-            "marginBottom": "4px",
-            "display": "block",
-        },
-    )
-
-
-def control_block(label_text, control):
-    return html.Div(
-        [field_label(label_text), control],
-        style={"display": "flex", "flexDirection": "column", "gap": "4px"},
-    )
-
-
 # ── Panel builder (editor view) ────────────────────────────────────────────────
+
 def make_panel(panel_id, removable=False):
     default_city_metrics = available_metrics_for_city(DEFAULT_CITY, DEFAULT_GROUP) if DEFAULT_CITY else []
     default_metric = default_city_metrics[0] if default_city_metrics else None
@@ -216,20 +199,14 @@ def make_panel(panel_id, removable=False):
     return html.Div(
         id={"type": "panel-wrapper", "index": panel_id},
         style={
-            "minWidth": "420px",
-            "flex": "0 0 420px",
-            "maxWidth": "420px",
-            "display": "flex",
-            "flexDirection": "column",
-            "gap": "8px",
+            "minWidth": "420px", "flex": "1 1 420px", "maxWidth": "900px",
+            "display": "flex", "flexDirection": "column", "gap": "8px",
         },
         children=[
             html.Div(
                 style={
-                    "background": "#ffffff",
-                    "border": "1px solid #e2e0db",
-                    "borderRadius": "8px",
-                    "padding": "12px 14px",
+                    "background": "#ffffff", "border": "1px solid #e2e0db",
+                    "borderRadius": "8px", "padding": "12px 14px",
                 },
                 children=[
                     html.Div(
@@ -249,19 +226,19 @@ def make_panel(panel_id, removable=False):
                                 id={"type": "remove-btn", "index": panel_id},
                                 title="Remove this map",
                                 style={
-                                    "background": "none",
-                                    "border": "none",
-                                    "cursor": "pointer",
-                                    "fontSize": "14px",
-                                    "color": "#7a7974",
-                                    "padding": "0 2px",
+                                    "background": "none", "border": "none", "cursor": "pointer",
+                                    "fontSize": "14px", "color": "#7a7974", "padding": "0 2px",
                                     "display": "block" if removable else "none",
                                 },
                             ),
                         ],
                     ),
-                    control_block(
-                        "City",
+                    html.Div([
+                        html.Label("City", style={
+                            "fontSize": "11px", "fontWeight": "600", "color": "#7a7974",
+                            "textTransform": "uppercase", "letterSpacing": "0.04em",
+                            "marginBottom": "3px",
+                        }),
                         dcc.Dropdown(
                             id={"type": "city-dd", "index": panel_id},
                             options=CITY_OPTIONS,
@@ -269,17 +246,21 @@ def make_panel(panel_id, removable=False):
                             clearable=False,
                             style={"fontSize": "13px"},
                         ),
-                    ),
-                    html.Div(style={"height": "8px"}),
+                    ], style={"marginBottom": "8px"}),
                     html.Div(
                         style={
                             "display": "grid",
                             "gridTemplateColumns": "1fr 1fr",
                             "gap": "8px",
+                            "marginBottom": "8px",
                         },
                         children=[
-                            control_block(
-                                "Metric group",
+                            html.Div([
+                                html.Label("Metric group", style={
+                                    "fontSize": "11px", "fontWeight": "600", "color": "#7a7974",
+                                    "textTransform": "uppercase", "letterSpacing": "0.04em",
+                                    "marginBottom": "3px",
+                                }),
                                 dcc.Dropdown(
                                     id={"type": "group-dd", "index": panel_id},
                                     options=GROUP_OPTIONS,
@@ -287,9 +268,13 @@ def make_panel(panel_id, removable=False):
                                     clearable=False,
                                     style={"fontSize": "13px"},
                                 ),
-                            ),
-                            control_block(
-                                "Metric",
+                            ]),
+                            html.Div([
+                                html.Label("Metric", style={
+                                    "fontSize": "11px", "fontWeight": "600", "color": "#7a7974",
+                                    "textTransform": "uppercase", "letterSpacing": "0.04em",
+                                    "marginBottom": "3px",
+                                }),
                                 dcc.Dropdown(
                                     id={"type": "metric-dd", "index": panel_id},
                                     options=[
@@ -300,12 +285,15 @@ def make_panel(panel_id, removable=False):
                                     clearable=False,
                                     style={"fontSize": "13px"},
                                 ),
-                            ),
+                            ]),
                         ],
                     ),
-                    html.Div(style={"height": "8px"}),
-                    control_block(
-                        "Colour scale",
+                    html.Div([
+                        html.Label("Colour scale", style={
+                            "fontSize": "11px", "fontWeight": "600", "color": "#7a7974",
+                            "textTransform": "uppercase", "letterSpacing": "0.04em",
+                            "marginBottom": "3px",
+                        }),
                         dcc.Dropdown(
                             id={"type": "cmap-dd", "index": panel_id},
                             options=[{"label": c, "value": c} for c in CMAPS],
@@ -313,41 +301,23 @@ def make_panel(panel_id, removable=False):
                             clearable=False,
                             style={"fontSize": "13px"},
                         ),
-                    ),
-                    html.Div(style={"height": "10px"}),
-                    html.Div(
-                        [
-                            field_label("# Quantiles"),
-                            dcc.Slider(
-                                id={"type": "quantiles-slider", "index": panel_id},
-                                min=2,
-                                max=50,
-                                step=1,
-                                value=7,
-                                marks={2: "2", 5: "5", 10: "10", 20: "20", 30: "30", 40: "40", 50: "50"},
-                                tooltip={"placement": "bottom", "always_visible": False},
-                            ),
-                        ]
-                    ),
+                    ]),
                 ],
             ),
             dcc.Graph(
                 id={"type": "hex-map", "index": panel_id},
                 style={
-                    "flex": "1",
-                    "minHeight": "520px",
-                    "borderRadius": "8px",
-                    "overflow": "hidden",
-                    "border": "1px solid #e2e0db",
-                    "background": "#ffffff",
+                    "flex": "1", "minHeight": "520px", "borderRadius": "8px",
+                    "overflow": "hidden", "border": "1px solid #e2e0db",
                 },
-                config={"scrollZoom": True, "displayModeBar": False},
+                config={"scrollZoom": True},
             ),
         ],
     )
 
 
 # ── Compare grid card ──────────────────────────────────────────────────────────
+
 def make_compare_card(panel_id, city, metric, cmap, quantiles):
     title = f"{city} · {metric.replace('_', ' ').title()}" if city and metric else f"Map {panel_id + 1}"
     return html.Div(
@@ -372,13 +342,12 @@ def make_compare_card(panel_id, city, metric, cmap, quantiles):
             ),
             dcc.Graph(
                 id={"type": "compare-map", "index": panel_id},
-                figure=make_map(city, metric, cmap or "Viridis", quantiles=quantiles or 7, compact=True),
+                figure=make_map(city, metric, cmap or "Viridis", quantiles=quantiles or DEFAULT_QUANTILES, compact=True),
                 style={
                     "height": "380px",
                     "borderRadius": "0 0 8px 8px",
                     "overflow": "hidden",
                     "border": "1px solid #e2e0db",
-                    "background": "#ffffff",
                 },
                 config={"scrollZoom": True, "displayModeBar": False},
             ),
@@ -387,6 +356,7 @@ def make_compare_card(panel_id, city, metric, cmap, quantiles):
 
 
 # ── App layout ─────────────────────────────────────────────────────────────────
+
 app = Dash(
     __name__,
     external_stylesheets=[
@@ -397,14 +367,9 @@ app = Dash(
 
 _header = html.Div(
     style={
-        "borderBottom": "1px solid #dcd9d5",
-        "background": "#ffffff",
-        "padding": "0 24px",
-        "display": "flex",
-        "alignItems": "center",
-        "justifyContent": "space-between",
-        "height": "52px",
-        "flexShrink": "0",
+        "borderBottom": "1px solid #dcd9d5", "background": "#ffffff",
+        "padding": "0 24px", "display": "flex", "alignItems": "center",
+        "justifyContent": "space-between", "height": "52px", "flexShrink": "0",
     },
     children=[
         html.Div(
@@ -420,10 +385,8 @@ _header = html.Div(
 
 app.layout = html.Div(
     style={
-        "background": "#f7f6f2",
-        "minHeight": "100vh",
-        "fontFamily": "'Satoshi', sans-serif",
-        "color": "#28251d",
+        "background": "#f7f6f2", "minHeight": "100vh",
+        "fontFamily": "'Satoshi', sans-serif", "color": "#28251d",
     },
     children=[
         html.Div(
@@ -437,18 +400,42 @@ app.layout = html.Div(
                         html.Div(
                             id="panels-container",
                             style={
-                                "display": "flex",
-                                "flexDirection": "row",
-                                "gap": "16px",
-                                "overflowX": "auto",
-                                "alignItems": "flex-start",
+                                "display": "flex", "flexDirection": "row", "gap": "16px",
+                                "overflowX": "auto", "alignItems": "flex-start",
                                 "paddingBottom": "12px",
                             },
                             children=[make_panel(0, removable=False)],
                         ),
                         html.Div(
-                            style={"marginTop": "16px", "display": "flex", "alignItems": "center", "gap": "10px"},
+                            style={"marginTop": "16px", "display": "flex",
+                                   "alignItems": "center", "gap": "10px"},
                             children=[
+                                html.Div(
+                                    style={"marginTop": "12px", "maxWidth": "320px"},
+                                    children=[
+                                        html.Label(
+                                            "# Quantiles",
+                                            style={
+                                                "fontSize": "11px",
+                                                "fontWeight": "600",
+                                                "color": "#7a7974",
+                                                "textTransform": "uppercase",
+                                                "letterSpacing": "0.04em",
+                                                "marginBottom": "4px",
+                                                "display": "block",
+                                            },
+                                        ),
+                                        dcc.Slider(
+                                            id="quantiles-slider",
+                                            min=2,
+                                            max=50,
+                                            step=1,
+                                            value=DEFAULT_QUANTILES,
+                                            marks={2: "2", 5: "5", 10: "10", 20: "20", 30: "30", 40: "40", 50: "50"},
+                                            tooltip={"placement": "bottom", "always_visible": False},
+                                        ),
+                                    ],
+                                ),
                                 html.Button(
                                     id="add-panel-btn",
                                     children=[
@@ -457,15 +444,12 @@ app.layout = html.Div(
                                     ],
                                     n_clicks=0,
                                     style={
-                                        "background": "#01696f",
-                                        "color": "#ffffff",
-                                        "border": "none",
-                                        "borderRadius": "6px",
-                                        "padding": "8px 16px",
-                                        "fontSize": "13px",
-                                        "fontWeight": "600",
-                                        "cursor": "pointer",
+                                        "background": "#01696f", "color": "#ffffff",
+                                        "border": "none", "borderRadius": "6px",
+                                        "padding": "8px 16px", "fontSize": "13px",
+                                        "fontWeight": "600", "cursor": "pointer",
                                         "fontFamily": "'Satoshi', sans-serif",
+                                        "transition": "background 180ms ease",
                                     },
                                 ),
                                 html.Button(
@@ -476,15 +460,12 @@ app.layout = html.Div(
                                     ],
                                     n_clicks=0,
                                     style={
-                                        "background": "#ffffff",
-                                        "color": "#01696f",
-                                        "border": "1.5px solid #01696f",
-                                        "borderRadius": "6px",
-                                        "padding": "8px 16px",
-                                        "fontSize": "13px",
-                                        "fontWeight": "600",
-                                        "cursor": "pointer",
+                                        "background": "#ffffff", "color": "#01696f",
+                                        "border": "1.5px solid #01696f", "borderRadius": "6px",
+                                        "padding": "8px 16px", "fontSize": "13px",
+                                        "fontWeight": "600", "cursor": "pointer",
                                         "fontFamily": "'Satoshi', sans-serif",
+                                        "transition": "all 180ms ease",
                                     },
                                 ),
                                 html.Span(
@@ -497,19 +478,16 @@ app.layout = html.Div(
                 ),
             ],
         ),
+
         html.Div(
             id="compare-overlay",
             style={"display": "none"},
             children=[
                 html.Div(
                     style={
-                        "borderBottom": "1px solid #dcd9d5",
-                        "background": "#ffffff",
-                        "padding": "0 24px",
-                        "display": "flex",
-                        "alignItems": "center",
-                        "justifyContent": "space-between",
-                        "height": "52px",
+                        "borderBottom": "1px solid #dcd9d5", "background": "#ffffff",
+                        "padding": "0 24px", "display": "flex", "alignItems": "center",
+                        "justifyContent": "space-between", "height": "52px",
                         "flexShrink": "0",
                     },
                     children=[
@@ -522,14 +500,10 @@ app.layout = html.Div(
                             children="← Back to editor",
                             n_clicks=0,
                             style={
-                                "background": "none",
-                                "border": "1.5px solid #dcd9d5",
-                                "borderRadius": "6px",
-                                "padding": "6px 14px",
-                                "cursor": "pointer",
-                                "color": "#28251d",
-                                "fontSize": "13px",
-                                "fontWeight": "600",
+                                "background": "none", "border": "1.5px solid #dcd9d5",
+                                "borderRadius": "6px", "padding": "6px 14px",
+                                "cursor": "pointer", "color": "#28251d",
+                                "fontSize": "13px", "fontWeight": "600",
                                 "fontFamily": "'Satoshi', sans-serif",
                             },
                         ),
@@ -538,36 +512,27 @@ app.layout = html.Div(
                 html.Div(
                     id="compare-grid",
                     style={
-                        "flex": "1",
-                        "overflowY": "auto",
-                        "padding": "20px",
+                        "flex": "1", "overflowY": "auto", "padding": "20px",
                         "display": "grid",
                         "gridTemplateColumns": "repeat(auto-fill, minmax(420px, 1fr))",
-                        "gap": "16px",
-                        "alignContent": "start",
+                        "gap": "16px", "alignContent": "start",
                     },
                     children=[],
                 ),
             ],
         ),
+
         dcc.Store(id="panel-ids", data=[0]),
         dcc.Store(id="next-panel-id", data=1),
-        dcc.Store(
-            id="panel-configs",
-            data={
-                "0": {
-                    "city": DEFAULT_CITY,
-                    "metric": DEFAULT_METRIC,
-                    "cmap": "Viridis",
-                    "quantiles": 7,
-                }
-            },
-        ),
+        dcc.Store(id="panel-configs", data={
+            "0": {"city": DEFAULT_CITY, "metric": DEFAULT_METRIC, "cmap": "Viridis", "quantiles": DEFAULT_QUANTILES},
+        }),
     ],
 )
 
 
 # ── Callbacks ──────────────────────────────────────────────────────────────────
+
 @callback(
     Output({"type": "metric-dd", "index": MATCH}, "options"),
     Output({"type": "metric-dd", "index": MATCH}, "value"),
@@ -589,10 +554,10 @@ def update_metric_options(city, group):
     Input({"type": "city-dd", "index": MATCH}, "value"),
     Input({"type": "metric-dd", "index": MATCH}, "value"),
     Input({"type": "cmap-dd", "index": MATCH}, "value"),
-    Input({"type": "quantiles-slider", "index": MATCH}, "value"),
+    Input("quantiles-slider", "value"),
 )
 def render_map(city, metric, cmap, quantiles):
-    return make_map(city, metric, cmap or "Viridis", quantiles=quantiles or 7)
+    return make_map(city, metric, cmap or "Viridis", quantiles=quantiles or DEFAULT_QUANTILES)
 
 
 @callback(
@@ -600,10 +565,10 @@ def render_map(city, metric, cmap, quantiles):
     Input({"type": "city-dd", "index": ALL}, "value"),
     Input({"type": "metric-dd", "index": ALL}, "value"),
     Input({"type": "cmap-dd", "index": ALL}, "value"),
-    Input({"type": "quantiles-slider", "index": ALL}, "value"),
     State("panel-ids", "data"),
+    State("quantiles-slider", "value"),
 )
-def track_configs(cities, metrics, cmaps, quantiles, panel_ids):
+def track_configs(cities, metrics, cmaps, panel_ids, quantiles):
     configs = {}
     fallback_city = DEFAULT_CITY
     fallback_metric = DEFAULT_METRIC
@@ -613,7 +578,7 @@ def track_configs(cities, metrics, cmaps, quantiles, panel_ids):
             "city": cities[i] if i < len(cities) else fallback_city,
             "metric": metrics[i] if i < len(metrics) else fallback_metric,
             "cmap": cmaps[i] if i < len(cmaps) else "Viridis",
-            "quantiles": quantiles[i] if i < len(quantiles) else 7,
+            "quantiles": quantiles or DEFAULT_QUANTILES,
         }
     return configs
 
@@ -653,9 +618,11 @@ def manage_panels(add_clicks, remove_clicks, panel_ids, next_id):
     Input("close-compare-btn", "n_clicks"),
     State("panel-ids", "data"),
     State("panel-configs", "data"),
-    prevent_initial_call=True,
 )
 def toggle_compare(open_clicks, close_clicks, panel_ids, configs):
+    open_clicks = open_clicks or 0
+    close_clicks = close_clicks or 0
+
     overlay_hidden = {"display": "none"}
     overlay_visible = {
         "display": "flex",
@@ -669,7 +636,7 @@ def toggle_compare(open_clicks, close_clicks, panel_ids, configs):
     editor_visible = {"display": "flex", "flexDirection": "column", "minHeight": "100vh"}
     editor_hidden = {"display": "none"}
 
-    if ctx.triggered_id == "close-compare-btn":
+    if close_clicks > open_clicks:
         return overlay_hidden, editor_visible, no_update
 
     cards = []
@@ -678,14 +645,13 @@ def toggle_compare(open_clicks, close_clicks, panel_ids, configs):
         city = cfg.get("city", DEFAULT_CITY)
         metric = cfg.get("metric", DEFAULT_METRIC)
         cmap = cfg.get("cmap", "Viridis")
-        quantiles = cfg.get("quantiles", 7)
+        quantiles = cfg.get("quantiles", DEFAULT_QUANTILES)
         cards.append(make_compare_card(pid, city, metric, cmap, quantiles))
 
     return overlay_visible, editor_hidden, cards
 
 
 server = app.server
-
 
 if __name__ == "__main__":
     app.run(debug=True)
