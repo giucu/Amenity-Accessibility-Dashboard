@@ -23,7 +23,7 @@ def discover_city_files(data_dir="data"):
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 
-CITIES = discover_city_files("data")
+CITIES = discover_city_files("data(60m,0.2)")
 
 city_data = {}
 all_columns = set()
